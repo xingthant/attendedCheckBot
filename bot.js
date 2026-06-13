@@ -1,15 +1,62 @@
-// bot-simple.js - No Express version for local testing
-// For production on Render, use the Express version
+// bot.js - Reads configuration from .env file
+// Version 3.2 - Environment variables support
 
+// Load environment variables from .env file
+require('dotenv').config();
+
+const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 
-// ==================== CONFIGURATION ====================
-const BOT_TOKEN = "8881474832:AAFiLiREyqCOCCiTcIY3Sybr9OeB1ithEYc";
+// ==================== CONFIGURATION FROM .env ====================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',') : [];
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || null;
+const PORT = process.env.PORT || 3000;
 
+// Validate required configuration
 if (!BOT_TOKEN) {
-    console.error('FATAL ERROR: BOT_TOKEN environment variable is not set!');
+    console.error('❌ FATAL ERROR: BOT_TOKEN not found in .env file!');
+    console.error('Please create .env file with BOT_TOKEN=your_token_here');
     process.exit(1);
 }
+
+if (ADMIN_IDS.length === 0) {
+    console.warn('⚠️ Warning: No ADMIN_IDS configured in .env file');
+    console.warn('Add ADMIN_IDS=your_id_here to .env file');
+}
+
+// ==================== EXPRESS SERVER FOR RENDER ====================
+const app = express();
+
+// Health check endpoint for Render
+app.get('/', (req, res) => {
+    res.send('Employee Attendance Bot is running!');
+});
+
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'healthy',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        employees: Object.keys(employees).length,
+        version: '3.2',
+        config: {
+            bot_configured: !!BOT_TOKEN,
+            admins_count: ADMIN_IDS.length,
+            group_configured: !!GROUP_CHAT_ID
+        }
+    });
+});
+
+// Start web server
+const server = app.listen(PORT, () => {
+    console.log(`🌐 Web server running on port ${PORT}`);
+    console.log(`✅ Health check available at: http://localhost:${PORT}/health`);
+});
+
+server.on('error', (error) => {
+    console.error('Server error:', error);
+});
 
 // Create bot instance with polling enabled
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -25,11 +72,10 @@ const WORK_START_SECOND = 0;
 // Late threshold (15 minutes grace period)
 const LATE_THRESHOLD_MINUTES = 15;
 
-// Admin configuration
-const ADMIN_IDS = ['7756391343'];
-
-// Group Chat ID (set if you have one)
-const GROUP_CHAT_ID = null;
+const ACTIVITY_TIMEOUT = 15 * 60 * 1000;
+let reminderInterval = null;
+let lateCheckInterval = null;
+let keepAliveInterval = null;
 
 // ==================== DATA STORAGE (In-Memory) ====================
 const employees = {};
@@ -41,10 +87,6 @@ const ACTIVITIES = {
     '厕所': { type: 'restroom', name: 'Restroom' },
     '下楼拿外卖': { type: 'delivery', name: 'Delivery' }
 };
-
-const ACTIVITY_TIMEOUT = 15 * 60 * 1000;
-let reminderInterval = null;
-let lateCheckInterval = null;
 
 // ==================== TIMEZONE HELPER FUNCTIONS ====================
 
@@ -130,7 +172,7 @@ async function sendNotification(message, parseMode = 'Markdown') {
         try {
             await bot.sendMessage(GROUP_CHAT_ID, message, { parse_mode: parseMode });
             sent = true;
-            console.log('Notification sent to group');
+            console.log('✅ Notification sent to group');
         } catch (err) {
             console.error(`Failed to send to group:`, err.message);
         }
@@ -140,11 +182,11 @@ async function sendNotification(message, parseMode = 'Markdown') {
         if (adminId && adminId.trim()) {
             try {
                 await bot.sendMessage(adminId.trim(), message, { parse_mode: parseMode });
-                console.log(`Notification sent to admin ${adminId}`);
+                console.log(`✅ Notification sent to admin ${adminId}`);
                 sent = true;
             } catch (err) {
                 if (err.message.includes('bot can\'t initiate conversation')) {
-                    console.log(`Admin ${adminId} needs to start a conversation first`);
+                    console.log(`⚠️ Admin ${adminId} needs to start a conversation first`);
                 } else {
                     console.error(`Failed to notify admin ${adminId}:`, err.message);
                 }
@@ -153,7 +195,7 @@ async function sendNotification(message, parseMode = 'Markdown') {
     }
     
     if (!sent) {
-        console.log('Notification (no recipients):', message.substring(0, 100));
+        console.log('📝 Notification (no recipients):', message.substring(0, 100));
     }
 }
 
@@ -163,7 +205,7 @@ function mentionUser(name, telegramId) {
 
 async function getUserInfo(msg) {
     if (msg.chat.type === 'channel') {
-        console.warn('Bot received a channel post');
+        console.warn('⚠️ Bot received a channel post');
         const telegramId = 'channel_' + msg.chat.id;
         const name = 'Channel User';
         
@@ -292,16 +334,26 @@ function checkLateArrivals() {
     }
 }
 
+function startKeepAlive() {
+    keepAliveInterval = setInterval(() => {
+        const timestamp = new Date().toISOString();
+        console.log(`💓 Keep-alive ping at ${timestamp}`);
+        fetch(`http://localhost:${PORT}/health`).catch(() => {});
+    }, 14 * 60 * 1000);
+    console.log('✅ Keep-alive system started (pings every 14 minutes)');
+}
+
 function startReminderSystems() {
     if (reminderInterval) clearInterval(reminderInterval);
     reminderInterval = setInterval(() => checkActivityTimeouts(), 60 * 1000);
-    console.log('Activity reminder system started');
+    console.log('✅ Activity reminder system started');
     
     if (lateCheckInterval) clearInterval(lateCheckInterval);
     lateCheckInterval = setInterval(() => checkLateArrivals(), 60 * 1000);
-    console.log('Late arrival checker started');
+    console.log('✅ Late arrival checker started');
 }
 
+// ==================== KEYBOARD LAYOUT ====================
 const mainKeyboard = {
     reply_markup: {
         keyboard: [
@@ -663,20 +715,34 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection:', reason);
 });
 
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, closing...');
+    if (reminderInterval) clearInterval(reminderInterval);
+    if (lateCheckInterval) clearInterval(lateCheckInterval);
+    if (keepAliveInterval) clearInterval(keepAliveInterval);
+    server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+    });
+});
+
 // ==================== STARTUP ====================
 
-console.log('Starting Employee Attendance Bot v3.1');
+console.log('🚀 Starting Employee Attendance Bot v3.2');
 console.log('================================================');
-console.log(`Timezone: ${MEXICO_TIMEZONE}`);
-console.log(`Work start: ${WORK_START_HOUR}:${WORK_START_MINUTE}:${WORK_START_SECOND}`);
-console.log(`Admins: ${ADMIN_IDS.join(', ')}`);
-console.log(`Group Chat: ${GROUP_CHAT_ID || 'Not set'}`);
-console.log('In-memory storage ready');
+console.log(`✅ Timezone: ${MEXICO_TIMEZONE}`);
+console.log(`✅ Work start: ${WORK_START_HOUR}:${WORK_START_MINUTE}:${WORK_START_SECOND}`);
+console.log(`✅ Admins: ${ADMIN_IDS.length > 0 ? ADMIN_IDS.join(', ') : 'None configured'}`);
+console.log(`✅ Group Chat: ${GROUP_CHAT_ID || 'Not set'}`);
+console.log(`✅ Bot Token: ${BOT_TOKEN ? 'Configured ✓' : 'Missing ✗'}`);
+console.log('✅ In-memory storage ready');
 
 startReminderSystems();
+startKeepAlive();
 
 console.log('================================================');
-console.log('Bot is running!');
-console.log('Commands: /start, /status, /report, /mytime, /help');
-console.log(`Mexico Time: ${formatTimeWithSeconds(getMexicoDate().getTime())}`);
+console.log('🎉 Bot is running!');
+console.log('📊 Commands: /start, /status, /report, /mytime, /help');
+console.log(`🕐 Mexico Time: ${formatTimeWithSeconds(getMexicoDate().getTime())}`);
 console.log('================================================');
