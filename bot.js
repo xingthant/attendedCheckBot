@@ -1,5 +1,5 @@
 // bot.js - Reads configuration from .env file
-// Version 3.2 - Environment variables support
+// Version 3.3 - Fixed Timezone Issue
 
 // Load environment variables from .env file
 require('dotenv').config();
@@ -28,6 +28,9 @@ if (ADMIN_IDS.length === 0) {
 // ==================== EXPRESS SERVER FOR RENDER ====================
 const app = express();
 
+// employees object needs to be accessible in routes
+const employees = {};
+
 // Health check endpoint for Render
 app.get('/', (req, res) => {
     res.send('Employee Attendance Bot is running!');
@@ -39,7 +42,7 @@ app.get('/health', (req, res) => {
         uptime: process.uptime(),
         timestamp: new Date().toISOString(),
         employees: Object.keys(employees).length,
-        version: '3.2',
+        version: '3.3',
         config: {
             bot_configured: !!BOT_TOKEN,
             admins_count: ADMIN_IDS.length,
@@ -77,9 +80,6 @@ let reminderInterval = null;
 let lateCheckInterval = null;
 let keepAliveInterval = null;
 
-// ==================== DATA STORAGE (In-Memory) ====================
-const employees = {};
-
 // Activity configurations
 const ACTIVITIES = {
     '吃饭': { type: 'meal', name: 'Meal Time' },
@@ -88,12 +88,37 @@ const ACTIVITIES = {
     '下楼拿外卖': { type: 'delivery', name: 'Delivery' }
 };
 
-// ==================== TIMEZONE HELPER FUNCTIONS ====================
+// ==================== TIMEZONE HELPER FUNCTIONS (FIXED) ====================
 
+/**
+ * Get current date/time in Mexico timezone
+ */
 function getMexicoDate() {
     return new Date(new Date().toLocaleString('en-US', { timeZone: MEXICO_TIMEZONE }));
 }
 
+/**
+ * Get Mexico timezone timestamp (milliseconds since epoch)
+ * This ensures all time comparisons are done in Mexico timezone context
+ */
+function getMexicoTimestamp() {
+    const mexicoDate = getMexicoDate();
+    // Create a Date object that represents the same wall-clock time in UTC
+    // This allows correct comparison with timestamps stored from Date.now()
+    return new Date(
+        mexicoDate.getFullYear(),
+        mexicoDate.getMonth(),
+        mexicoDate.getDate(),
+        mexicoDate.getHours(),
+        mexicoDate.getMinutes(),
+        mexicoDate.getSeconds(),
+        mexicoDate.getMilliseconds()
+    ).getTime();
+}
+
+/**
+ * Format time with seconds in Mexico timezone
+ */
 function formatTimeWithSeconds(timestamp) {
     if (!timestamp) return 'N/A';
     const date = new Date(timestamp);
@@ -106,6 +131,9 @@ function formatTimeWithSeconds(timestamp) {
     });
 }
 
+/**
+ * Format duration as HH:MM:SS
+ */
 function formatDurationAsHMS(ms) {
     if (!ms || ms < 0) return '00:00:00';
     
@@ -117,6 +145,9 @@ function formatDurationAsHMS(ms) {
     return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
 }
 
+/**
+ * Format duration as Xh Ym Zs
+ */
 function formatDurationWithSeconds(ms) {
     if (!ms || ms < 0) return '0s';
     
@@ -133,6 +164,9 @@ function formatDurationWithSeconds(ms) {
     return parts.join(' ');
 }
 
+/**
+ * Get today's work start time as a Mexico-timezone Date object
+ */
 function getWorkStartTime() {
     const now = getMexicoDate();
     const workStart = new Date(now);
@@ -140,31 +174,92 @@ function getWorkStartTime() {
     return workStart;
 }
 
+/**
+ * Get today's work start timestamp for comparison
+ */
+function getWorkStartTimestamp() {
+    const workStart = getWorkStartTime();
+    // Convert to UTC timestamp for comparison with Date.now()
+    return new Date(
+        workStart.getFullYear(),
+        workStart.getMonth(),
+        workStart.getDate(),
+        workStart.getHours(),
+        workStart.getMinutes(),
+        workStart.getSeconds(),
+        workStart.getMilliseconds()
+    ).getTime();
+}
+
+/**
+ * Check if a user is late (FIXED)
+ * Compares the start time with Mexico work start time
+ */
 function isUserLate(startTimestamp) {
     if (!startTimestamp) return false;
     
-    const startTime = new Date(startTimestamp);
-    const workStartTime = getWorkStartTime();
-    const lateThreshold = LATE_THRESHOLD_MINUTES * 60 * 1000;
+    const startDate = new Date(startTimestamp);
+    const workStartTimestamp = getWorkStartTimestamp();
+    const workStartDate = new Date(workStartTimestamp);
     
-    return startTime > new Date(workStartTime.getTime() + lateThreshold);
+    // Get hours and minutes in Mexico timezone for both times
+    const startMexicoHour = startDate.toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE });
+    const startMexicoMinute = startDate.toLocaleTimeString('en-US', { minute: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE });
+    const workStartMexicoHour = workStartDate.toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE });
+    const workStartMexicoMinute = workStartDate.toLocaleTimeString('en-US', { minute: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE });
+    
+    const startHour = parseInt(startMexicoHour);
+    const startMinute = parseInt(startMexicoMinute);
+    const workHour = parseInt(workStartMexicoHour);
+    const workMinute = parseInt(workStartMexicoMinute);
+    
+    // Calculate total minutes after work start
+    const startTotalMinutes = startHour * 60 + startMinute;
+    const workTotalMinutes = workHour * 60 + workMinute;
+    const minutesLate = startTotalMinutes - workTotalMinutes;
+    
+    // Check if late beyond grace period
+    return minutesLate > LATE_THRESHOLD_MINUTES;
 }
 
+/**
+ * Get late duration in milliseconds (FIXED)
+ */
 function getLateDuration(startTimestamp) {
     if (!startTimestamp) return 0;
     
-    const startTime = new Date(startTimestamp);
-    const workStartTime = getWorkStartTime();
-    const lateDuration = startTime - workStartTime;
+    const startDate = new Date(startTimestamp);
+    const workStartTimestamp = getWorkStartTimestamp();
     
-    return Math.max(0, lateDuration);
+    // Get Mexico timezone values
+    const startMexicoHour = parseInt(startDate.toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE }));
+    const startMexicoMinute = parseInt(startDate.toLocaleTimeString('en-US', { minute: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE }));
+    const startMexicoSecond = parseInt(startDate.toLocaleTimeString('en-US', { second: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE }));
+    
+    const workStartDate = new Date(workStartTimestamp);
+    const workMexicoHour = parseInt(workStartDate.toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE }));
+    const workMexicoMinute = parseInt(workStartDate.toLocaleTimeString('en-US', { minute: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE }));
+    const workMexicoSecond = parseInt(workStartDate.toLocaleTimeString('en-US', { second: '2-digit', hour12: false, timeZone: MEXICO_TIMEZONE }));
+    
+    // Calculate milliseconds late
+    const startTotalMs = (startMexicoHour * 3600 + startMexicoMinute * 60 + startMexicoSecond) * 1000;
+    const workTotalMs = (workMexicoHour * 3600 + workMexicoMinute * 60 + workMexicoSecond) * 1000;
+    const lateMs = startTotalMs - workTotalMs;
+    
+    return Math.max(0, lateMs);
 }
 
+/**
+ * Get formatted late duration
+ */
 function getLateDurationFormatted(startTimestamp) {
     const lateMs = getLateDuration(startTimestamp);
     return formatDurationAsHMS(lateMs);
 }
 
+/**
+ * Send notification to group and admins
+ */
 async function sendNotification(message, parseMode = 'Markdown') {
     let sent = false;
     
@@ -199,10 +294,16 @@ async function sendNotification(message, parseMode = 'Markdown') {
     }
 }
 
+/**
+ * Create a user mention for Telegram
+ */
 function mentionUser(name, telegramId) {
     return `[${name}](tg://user?id=${telegramId})`;
 }
 
+/**
+ * Get or create user info from message
+ */
 async function getUserInfo(msg) {
     if (msg.chat.type === 'channel') {
         console.warn('⚠️ Bot received a channel post');
@@ -266,6 +367,9 @@ async function getUserInfo(msg) {
     return { telegramId, name };
 }
 
+/**
+ * Check for activity timeouts (unchanged)
+ */
 function checkActivityTimeouts() {
     const now = Date.now();
     
@@ -304,20 +408,24 @@ function checkActivityTimeouts() {
     }
 }
 
+/**
+ * Check for late arrivals (FIXED - uses Mexico time for hour check)
+ */
 function checkLateArrivals() {
-    const workStartTime = getWorkStartTime();
-    const lateThresholdTime = new Date(workStartTime.getTime() + (LATE_THRESHOLD_MINUTES * 60 * 1000));
-    const now = getMexicoDate();
+    const mexicoNow = getMexicoDate();
+    const currentHour = mexicoNow.getHours();
     
-    if (now.getHours() < 8 || now.getHours() > 12) {
+    // Only check between 8:00 AM and 12:00 PM Mexico time
+    if (currentHour < 8 || currentHour > 12) {
         return;
     }
     
     for (const [telegramId, emp] of Object.entries(employees)) {
         if (telegramId.startsWith('channel_')) continue;
         
+        // Check if employee has started work and late notification not sent yet
         if (emp.status !== 'off' && emp.workStart && !emp.lateNotified) {
-            if (isUserLate(emp.workStart) && now >= lateThresholdTime) {
+            if (isUserLate(emp.workStart)) {
                 const lateDurationMs = getLateDuration(emp.workStart);
                 const lateDurationHMS = formatDurationAsHMS(lateDurationMs);
                 const lateDurationText = formatDurationWithSeconds(lateDurationMs);
@@ -334,6 +442,9 @@ function checkLateArrivals() {
     }
 }
 
+/**
+ * Start keep-alive pings
+ */
 function startKeepAlive() {
     keepAliveInterval = setInterval(() => {
         const timestamp = new Date().toISOString();
@@ -343,6 +454,9 @@ function startKeepAlive() {
     console.log('✅ Keep-alive system started (pings every 14 minutes)');
 }
 
+/**
+ * Start reminder systems
+ */
 function startReminderSystems() {
     if (reminderInterval) clearInterval(reminderInterval);
     reminderInterval = setInterval(() => checkActivityTimeouts(), 60 * 1000);
@@ -427,14 +541,15 @@ bot.onText(/\/mytime/, async (msg) => {
     const mexicoTime = getMexicoDate();
     const workStartTime = getWorkStartTime();
     
-    const timeMessage = `Current Mexico Time
+    const timeMessage = `*Current Mexico Time*
 
-Date: ${mexicoTime.toLocaleDateString('zh-CN')}
-Time: ${formatTimeWithSeconds(mexicoTime.getTime())}
+📅 Date: ${mexicoTime.toLocaleDateString('zh-CN')}
+⏱️ Time: ${formatTimeWithSeconds(mexicoTime.getTime())}
 
-Work Start: ${formatTimeWithSeconds(workStartTime.getTime())}`;
+🏢 Work Start: ${formatTimeWithSeconds(workStartTime.getTime())}
+⏰ Late After: ${WORK_START_HOUR + Math.floor((WORK_START_MINUTE + LATE_THRESHOLD_MINUTES) / 60)}:${(WORK_START_MINUTE + LATE_THRESHOLD_MINUTES) % 60}`;
     
-    bot.sendMessage(chatId, timeMessage);
+    bot.sendMessage(chatId, timeMessage, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/status/, async (msg) => {
@@ -468,12 +583,12 @@ bot.onText(/\/status/, async (msg) => {
     }
     
     let statusMessage = '*Employee Status*\n\n';
-    statusMessage += 'WORKING\n';
+    statusMessage += '🟢 WORKING\n';
     statusMessage += working.length > 0 ? working.join('\n') : 'None\n';
     if (late.length > 0) {
-        statusMessage += `\nLate Arrivals: ${late.length}\n`;
+        statusMessage += `\n⚠️ Late Arrivals: ${late.length}\n`;
     }
-    statusMessage += '\nAWAY\n';
+    statusMessage += '\n🟡 AWAY\n';
     statusMessage += away.length > 0 ? away.join('\n') : 'None';
     
     bot.sendMessage(chatId, statusMessage, { parse_mode: 'Markdown' });
@@ -508,12 +623,12 @@ bot.onText(/\/report/, async (msg) => {
         reportMessage += `*${emp.name}*\n`;
         reportMessage += `Start: ${formatTimeWithSeconds(workStart)}\n`;
         reportMessage += `Finish: ${formatTimeWithSeconds(workEnd)}\n`;
-        if (isLate) reportMessage += `Late by: ${getLateDurationFormatted(workStart)}\n`;
+        if (isLate) reportMessage += `⚠️ Late by: ${getLateDurationFormatted(workStart)}\n`;
         reportMessage += `\n*Breakdown:*\n`;
-        reportMessage += `Meal: ${formatDurationWithSeconds(totals.meal)}\n`;
-        reportMessage += `Smoke: ${formatDurationWithSeconds(totals.smoke)}\n`;
-        reportMessage += `Restroom: ${formatDurationWithSeconds(totals.restroom)}\n`;
-        reportMessage += `Delivery: ${formatDurationWithSeconds(totals.delivery)}\n`;
+        reportMessage += `🍚 Meal: ${formatDurationWithSeconds(totals.meal)}\n`;
+        reportMessage += `🚬 Smoke: ${formatDurationWithSeconds(totals.smoke)}\n`;
+        reportMessage += `🚽 Restroom: ${formatDurationWithSeconds(totals.restroom)}\n`;
+        reportMessage += `📦 Delivery: ${formatDurationWithSeconds(totals.delivery)}\n`;
         reportMessage += `\n✅ Total Work: ${formatDurationWithSeconds(totalWorkMs)}\n\n`;
     }
     
@@ -557,21 +672,21 @@ bot.onText(/上班/, async (msg) => {
             totals: { ...emp.totals }
         };
         
-        const isLate = isUserLate(now);
+        const late = isUserLate(now);
         const actualTimeFormatted = formatTimeWithSeconds(now);
         
         let response = `✅ ${name} started work\n⏱️ ${actualTimeFormatted}`;
         
-        if (isLate) {
+        if (late) {
             const lateDurationText = formatDurationWithSeconds(getLateDuration(now));
             response += `\n\n⚠️ You are late!\n⏱️ Late by: ${lateDurationText}`;
             
             const userMention = mentionUser(name, telegramId);
-            sendNotification(`⚠️ LATE ARRIVAL\n\n${userMention} started work at ${actualTimeFormatted}`, 'Markdown');
+            sendNotification(`⚠️ LATE ARRIVAL\n\n${userMention} started work at ${actualTimeFormatted}\nLate by: ${lateDurationText}`, 'Markdown');
         }
         
         bot.sendMessage(chatId, response, { parse_mode: 'Markdown', ...mainKeyboard });
-        console.log(`[LOG] ${name} started at ${actualTimeFormatted}`);
+        console.log(`[LOG] ${name} started at ${actualTimeFormatted} ${late ? '(LATE)' : '(ON TIME)'}`);
     } catch (error) {
         console.error('Error in 上班:', error);
         bot.sendMessage(chatId, '❌ Error processing request.');
@@ -729,10 +844,11 @@ process.on('SIGTERM', () => {
 
 // ==================== STARTUP ====================
 
-console.log('🚀 Starting Employee Attendance Bot v3.2');
+console.log('🚀 Starting Employee Attendance Bot v3.3');
 console.log('================================================');
 console.log(`✅ Timezone: ${MEXICO_TIMEZONE}`);
 console.log(`✅ Work start: ${WORK_START_HOUR}:${WORK_START_MINUTE}:${WORK_START_SECOND}`);
+console.log(`✅ Late threshold: ${LATE_THRESHOLD_MINUTES} minutes`);
 console.log(`✅ Admins: ${ADMIN_IDS.length > 0 ? ADMIN_IDS.join(', ') : 'None configured'}`);
 console.log(`✅ Group Chat: ${GROUP_CHAT_ID || 'Not set'}`);
 console.log(`✅ Bot Token: ${BOT_TOKEN ? 'Configured ✓' : 'Missing ✗'}`);
@@ -744,5 +860,6 @@ startKeepAlive();
 console.log('================================================');
 console.log('🎉 Bot is running!');
 console.log('📊 Commands: /start, /status, /report, /mytime, /help');
-console.log(`🕐 Mexico Time: ${formatTimeWithSeconds(getMexicoDate().getTime())}`);
+console.log(`🕐 Current Mexico Time: ${formatTimeWithSeconds(getMexicoDate().getTime())}`);
+console.log(`🏢 Work Start (Mexico): ${formatTimeWithSeconds(getWorkStartTimestamp())}`);
 console.log('================================================');
